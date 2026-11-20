@@ -1,0 +1,194 @@
+name: sync-todo-readme-once
+
+on:
+  push:
+    branches: [dev]
+    paths: ['.github/workflows/sync-todo-readme-once.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-todo-readme:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+
+      - name: Synchronize Complete TODO List
+        run: |
+          cat > /tmp/sync_todo_readme.py <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+
+          ROOT = Path(".")
+          README = ROOT / "README.md"
+          TITLE = "### 📝 Complete TODO List"
+          KNOWN_CHANGED = {
+              "luffy/deepscaler/utils.py",
+              "luffy/verl/verl/protocol.py",
+          }
+          EXPECTED_COUNTS = {
+              "luffy/deepscaler/utils.py": 11,
+              "luffy/verl/verl/protocol.py": 7,
+          }
+          ENTRY_RE = re.compile(
+              r"^- \[ \] \*\*(?P<path>.+?):(?P<line>\d+)\*\* - (?P<msg>.*)$"
+          )
+          TODO_RE = re.compile(r"^(\s*)#\s*TODO\b\s*:?\s?(.*?)\s*$")
+
+          def rel_posix(p: Path) -> str:
+              return p.as_posix().lstrip("./")
+
+          def extract_todos(path: Path):
+              records = []
+              text = path.read_text(encoding="utf-8", errors="replace")
+              for lineno, raw_line in enumerate(text.splitlines(), 1):
+                  if "#" not in raw_line or "TODO" not in raw_line:
+                      continue
+                  m = TODO_RE.match(raw_line)
+                  if not m:
+                      # Also tolerate a TODO later after code on the same line.
+                  hash_at = raw_line.find("#")
+                  comment = raw_line[hash_at:]
+                  cm = re.match(r"#\s*TODO\b\s*:?\s?(.*?)\s*$", comment)
+                  if not cm:
+                      continue
+                  message = cm.group(1)
+                  else:
+                      message = m.group(2)
+                  records.append((rel_posix(path), lineno, message))
+              return records
+
+          # Search every Python file in the dev checkout.
+          all_by_path = {}
+          all_records = []
+          for path in sorted(ROOT.rglob("*.py"), key=rel_posix):
+              if ".git" in path.parts or not path.is_file():
+                  continue
+              records = extract_todos(path)
+              if records:
+                  rp = rel_posix(path)
+                  all_by_path[rp] = records
+                  all_records.extend(records)
+
+          print(f"Scanned Python TODO records: {len(all_records)}")
+          for rp in sorted(all_by_path):
+              print(f"{rp}: {len(all_by_path[rp])}")
+
+          changed = set(KNOWN_CHANGED)
+          try:
+              subprocess.run(
+                  ["git", "fetch", "origin", "main", "--depth=100"],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+                  timeout=60,
+              )
+              diff = subprocess.check_output(
+                  ["git", "diff", "--name-only", "origin/main...HEAD"],
+                  text=True,
+                  timeout=60,
+              )
+              changed.update(x for x in diff.splitlines() if x.endswith(".py"))
+          except Exception as exc:
+              print(f"Using known changed files because git diff failed: {exc!r}")
+          changed = {p for p in changed if p in EXPECTED_COUNTS or p in KNOWN_CHANGED}
+          # This task's main-to-dev Python delta consists of these two files.
+          changed |= KNOWN_CHANGED
+
+          for path in sorted(changed):
+              records = all_by_path.get(path, [])
+              expected = EXPECTED_COUNTS.get(path)
+              if expected is not None and len(records) != expected:
+                  raise SystemExit(
+                      f"{path}: expected {expected} current TODOs, found {len(records)}: {records!r}"
+                  )
+
+          original = README.read_text(encoding="utf-8")
+          lines = original.splitlines()
+          try:
+              title_index = lines.index(TITLE)
+          except ValueError as exc:
+              raise SystemExit("Required README section title is missing") from exc
+
+          section_end = None
+          for i in range(title_index + 1, len(lines)):
+              if lines[i].startswith("## "):
+                  section_end = i
+                  break
+          if section_end is None:
+              raise SystemExit("Could not find the end of the Complete TODO List section")
+
+          entries = []
+          for line in lines[title_index + 1:section_end]:
+              m = ENTRY_RE.match(line)
+              if not m:
+                  continue
+              path = m.group("path")
+              lineno = int(m.group("line"))
+              if path in changed:
+                  continue
+              entries.append((path, lineno, line))
+
+          for path in sorted(changed):
+              for _, lineno, message in all_by_path.get(path, []):
+                  rendered = f"- [ ] **{path}:{lineno}** - {message}"
+                  entries.append((path, lineno, rendered))
+
+          entries.sort(key=lambda item: (item[0], item[1]))
+          rendered_entries = [item[2] for item in entries]
+
+          new_lines = (
+              lines[:title_index]
+              + [TITLE, ""]
+              + rendered_entries
+              + [""]
+              + lines[section_end:]
+          )
+          updated = "\n".join(new_lines)
+          if original.endswith("\n"):
+              updated += "\n"
+
+          if TITLE not in updated or updated.count(TITLE) != 1:
+              raise SystemExit("README title invariant failed")
+          if "## 🤝 Contributing" not in updated:
+              raise SystemExit("README following section was lost")
+
+          if updated != original:
+              import difflib
+              diff_text = "".join(
+                  difflib.unified_diff(
+                      original.splitlines(keepends=True),
+                      updated.splitlines(keepends=True),
+                      fromfile="a/README.md",
+                      tofile="b/README.md",
+                      n=2,
+                  )
+              )
+              print(diff_text[:60000])
+              README.write_text(updated, encoding="utf-8")
+              print(f"Updated README with {len(rendered_entries)} TODO entries")
+          else:
+              print("README already matches the extracted main-to-dev TODO state")
+          PY
+          python3 /tmp/sync_todo_readme.py
+
+      - name: Commit README update
+        run: |
+          if git diff --quiet -- README.md; then
+            echo "README has no changes"
+            exit 0
+          fi
+          git config user.name "archbardvice"
+          git config user.email "sajedmd163@gmail.com"
+          git add README.md
+          git commit -m "docs: update complete TODO list for dev"
+          git push origin HEAD:dev
